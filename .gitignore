@@ -1,0 +1,8 @@
+venv
+__pycache__
+.env
+service_account.json
+orders.csv
+summary.csv
+polls_db.json
+lunch-drc-bot*

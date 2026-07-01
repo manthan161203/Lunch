@@ -28,5 +28,6 @@ PATTERN = re.compile(
 
 # Shared global states
 TODAYS_MENUS = []
-client = NewClient("lunch-drc-bot")
+SESSION_DB = os.environ.get("SESSION_DB", "lunch-drc-bot")
+client = NewClient(SESSION_DB)
 BOOT_TIME = datetime.datetime.now(TZ)

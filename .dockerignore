@@ -1,0 +1,18 @@
+venv
+__pycache__
+*.pyc
+.git
+.gitignore
+
+# Secrets and runtime state — never bake into the image
+.env
+service_account.json
+orders.csv
+summary.csv
+polls_db.json
+lunch-drc-bot*
+
+# Docker/meta
+Dockerfile
+.dockerignore
+README.md

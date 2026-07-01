@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 from neonize.utils.jid import Jid2String
 import requests
 
@@ -25,37 +26,92 @@ def initialize_storage():
         print(f"Initialized new file: {config.SUMMARY_CSV_FILE}")
 
 
+def _guess_vendor_heuristic(poll_name: str) -> str:
+    """
+    Best-effort vendor extraction without the LLM. Vendor names in the group
+    are typically Indian names ending in 'bhai' and are appended to the poll,
+    often after a run of 2+ spaces or on the last line.
+    """
+    lines = [ln for ln in poll_name.splitlines() if ln.strip()]
+
+    # 1. Prefer a token ending in 'bhai' (scan from the bottom up).
+    for line in reversed(lines):
+        m = re.search(r"\b([A-Za-z]+bhai)\b", line, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    # 2. Vendor is often after a gap of 2+ spaces on the last non-empty line.
+    if lines:
+        last = lines[-1].strip()
+        parts = re.split(r"\s{2,}", last)
+        if len(parts) > 1 and parts[-1].strip():
+            return parts[-1].strip()
+        words = last.split()
+        if words:
+            return words[-1]
+
+    # 3. Last resort: first word.
+    words = poll_name.strip().split()
+    return words[0] if words else poll_name.strip()
+
+
+def extract_vendor_llm(poll_name: str) -> str:
+    """
+    Uses Groq to extract just the vendor/tiffin-provider name from a poll title.
+    The vendor may appear at the start, end, or on its own line, so we let the
+    LLM locate it. Falls back to a heuristic if the API is unavailable or fails.
+    """
+    if not config.GROQ_API_KEY:
+        return _guess_vendor_heuristic(poll_name)
+
+    headers = {
+        "Authorization": f"Bearer {config.GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    prompt = (
+        "You are given the title of a WhatsApp lunch poll. It lists one or more dishes and, "
+        "somewhere in it, the name of the tiffin vendor/provider (usually an Indian name, often "
+        "ending in 'bhai', e.g. 'Ketanbhai', 'Dineshbhai', 'Rameshbhai', 'Kundan'). The vendor "
+        "name may appear at the start, at the end, or on its own line.\n"
+        "Return ONLY the vendor name as plain text — no dishes, no prices, no quotes, no explanation.\n"
+        "If you truly cannot find a vendor name, return the single word: UNKNOWN\n\n"
+        f"Poll title:\n{poll_name}"
+    )
+    data = {
+        "model": config.GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=15,
+        )
+        if response.status_code != 200:
+            print(f"Groq vendor-extract error {response.status_code}: {response.text}")
+            return _guess_vendor_heuristic(poll_name)
+
+        content = response.json()["choices"][0]["message"]["content"].strip()
+        vendor = content.splitlines()[0].strip().strip('"').strip("'").strip()
+        if vendor and vendor.upper() != "UNKNOWN":
+            return vendor
+    except Exception as e:
+        print("Error extracting vendor via Groq:", e)
+
+    return _guess_vendor_heuristic(poll_name)
+
+
 def get_vendor_for_poll(poll_name: str) -> str:
     """
-    Matches the poll name against today's active menus to find the vendor name.
-    If no match is found, defaults to the first word of the poll name.
+    Resolves the vendor name for a poll. Vendor position varies (start/end/own line),
+    so the LLM does the extraction, with a heuristic fallback.
     """
-    # 1. Split first word as a default candidate
-    words = poll_name.strip().split()
-    default_vendor = words[0] if words else poll_name
-    
-    # 2. Try to match against today's active vendors in config.TODAYS_MENUS
-    try:
-        now_dt = datetime.datetime.now(config.TZ)
-        date_str = now_dt.strftime("%Y-%m-%d")
-        
-        # Get list of vendors who posted menus today
-        today_vendors = set()
-        for item in config.TODAYS_MENUS:
-            if item["date"] == date_str:
-                today_vendors.add(item["vendor"].strip().lower())
-                
-        # Find if any active vendor name is inside the poll name
-        for v in today_vendors:
-            if v in poll_name.lower():
-                # Return original casing from the list
-                for item in config.TODAYS_MENUS:
-                    if item["vendor"].strip().lower() == v:
-                        return item["vendor"].strip()
-    except Exception as e:
-        print("Error getting vendor for poll:", e)
-        
-    return default_vendor
+    vendor = extract_vendor_llm(poll_name)
+    print(f"Poll vendor resolved: {vendor!r} from title {poll_name!r}")
+    return vendor
 
 
 def add_menu_in_memory(date_str: str, vendor: str, menu: str, price1: str, price2: str, posted_by: str, time_str: str) -> bool:
@@ -122,6 +178,44 @@ def write_order_to_csv(date_str: str, time_str: str, person: str, vendor: str, s
             
     except Exception as e:
         print("Error writing order to CSV:", e)
+
+
+def delete_order_from_csv(date_str: str, person: str, vendor: str) -> bool:
+    """
+    Removes a person's order for a given Date + Vendor. Used when a poll vote is
+    cleared, so the order disappears entirely instead of leaving a placeholder row.
+    Returns True if a row was removed.
+    """
+    try:
+        if not os.path.exists(config.ORDERS_CSV_FILE):
+            return False
+        with open(config.ORDERS_CSV_FILE, "r", newline="", encoding="utf-8") as f:
+            existing_rows = list(csv.reader(f))
+        if not existing_rows:
+            return False
+
+        headers = existing_rows[0]
+        data_rows = existing_rows[1:]
+
+        kept_rows = [
+            row for row in data_rows
+            if not (len(row) >= 4 and row[0] == date_str and row[2] == person and row[3] == vendor)
+        ]
+        removed = len(data_rows) - len(kept_rows)
+
+        if removed:
+            with open(config.ORDERS_CSV_FILE, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(kept_rows)
+            print(f"Removed cleared vote from orders.csv: {person} for '{vendor}'")
+            return True
+
+        print(f"Cleared vote had no existing order to remove: {person} for '{vendor}'")
+        return False
+    except Exception as e:
+        print("Error deleting order from CSV:", e)
+        return False
 
 
 def parse_message_regex(text: str):

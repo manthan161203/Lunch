@@ -188,13 +188,16 @@ def handle_poll_vote(client: NewClient, evt) -> bool:
                     voted_options.append(opt)
             
             if not voted_options:
-                voted_options = ["None (Cleared Vote)"]
-            
+                # Vote cleared: remove the person's order for this vendor entirely.
+                utils.delete_order_from_csv(date_str, voter_display, vendor_name)
+                utils.generate_monthly_summary()
+                return True
+
             voted_str = ", ".join(voted_options)
-            
+
             # Write order locally
             utils.write_order_to_csv(date_str, time_str, voter_display, vendor_name, voted_str)
-            
+
             # Automatically regenerate monthly summary
             utils.generate_monthly_summary()
         else:
@@ -272,6 +275,7 @@ def handle_menu_posting(evt, text: str) -> bool:
     """
     parsed_items = utils.parse_message_llm(text)
     if not parsed_items:
+        print(f"Menu NOT detected (parser returned no items) for text: {text!r}")
         return False
 
     now_dt = datetime.datetime.now(config.TZ)
@@ -279,15 +283,16 @@ def handle_menu_posting(evt, text: str) -> bool:
     time_str = now_dt.strftime("%H:%M")
 
     for item in parsed_items:
-        vendor = item.get("vendor", "").strip()
-        menu = item.get("menu", "").strip()
-        price1 = str(item.get("price1", ""))
-        price2 = str(item.get("price2", ""))
-        
+        vendor = (item.get("vendor") or "").strip()
+        menu = (item.get("menu") or "").strip()
+        price1 = str(item.get("price1") or "").strip()
+        price2 = str(item.get("price2") or "").strip()
+
         if not price2 and price1:
             price2 = price1
-            
+
         if not vendor or not menu or not price1:
+            print(f"Skipping menu item (missing vendor/menu/price): {item!r} from text: {text!r}")
             continue
 
         posted_by = utils.get_voter_display(evt)
@@ -297,6 +302,40 @@ def handle_menu_posting(evt, text: str) -> bool:
         if logged:
             print("Logged Menu (in-memory):", item)
     return True
+
+
+def handle_undecryptable_message(evt):
+    """
+    Fires when WhatsApp couldn't decrypt a message (usually a missing sender key).
+    Stays quiet for other groups, but prints a LOUD alert if it happens in the
+    lunch group, since that could be a menu/poll/vote we've silently lost.
+    """
+    try:
+        chat_jid = Jid2String(evt.Info.MessageSource.Chat)
+    except Exception:
+        return
+
+    if config.GROUP_JID not in chat_jid:
+        # Some other group — harmless, ignore.
+        return
+
+    try:
+        sender = utils.get_voter_display(evt)
+    except Exception:
+        sender = "unknown sender"
+
+    try:
+        ts = datetime.datetime.fromtimestamp(evt.Info.Timestamp, tz=config.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = "unknown time"
+
+    print("=" * 60)
+    print("⚠️  DECRYPT FAILURE IN LUNCH GROUP — MESSAGE LOST")
+    print(f"    From : {sender}")
+    print(f"    Time : {ts}")
+    print(f"    Msg ID: {getattr(evt.Info, 'ID', '?')}")
+    print("    ACTION: Ask this person to RE-POST their menu/poll or re-vote.")
+    print("=" * 60)
 
 
 def process_incoming_message(evt):
